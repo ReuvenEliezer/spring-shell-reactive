@@ -81,24 +81,30 @@ public class GithubCommand {
         Flux<Map<String, String>> allContainsDependency = retrieveAllContainsDependency(pomData, allJavaRepo, headers, repositoriesNames);
 
         //aggregate by module
-        Mono<Map<String, Set<String>>> moduleToReposAggregatedMap = allContainsDependency
-                .flatMap(map -> Flux.fromIterable(map.entrySet()))
-                .groupBy(Map.Entry::getKey)
-                .flatMap(groupedFlux -> groupedFlux
-                        .map(Map.Entry::getValue)
-                        .collect(Collectors.toSet())
-                        .map(set -> Map.of(groupedFlux.key(), set))
-                )
-                .reduce(new HashMap<>(), (acc, map) -> {
-                    acc.putAll(map);
-                    return acc;
-                });
-        Map<String, Set<String>> moduleToReposAggregatedSortedBySizeMap = moduleToReposAggregatedMap.block().entrySet().stream()
-                .sorted(Map.Entry.<String, Set<String>>comparingByValue(Comparator.comparingInt(Set::size)).reversed())
-                .collect(LinkedHashMap::new, (acc, entry) -> acc.put(entry.getKey(), entry.getValue()), Map::putAll);
+        Mono<Map<String, Set<String>>> moduleToReposAggregatedMap = aggregateByModule(allContainsDependency);
+        Map<String, Set<String>> moduleToReposAggregatedSortedBySizeMap = sort(moduleToReposAggregatedMap);
 
         logger.info("total repositories: {}, repositoriesNames: {} out of {} java repositories", repositoriesNames.size(), repositoriesNames, javaRepoCounter.get());
         printToCsv(repositoryName, moduleToReposAggregatedSortedBySizeMap);
+    }
+
+
+    private static HttpHeaders buildHeader(String token) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.ACCEPT, "application/vnd.github+json");
+        headers.set(HttpHeaders.AUTHORIZATION, String.format("Bearer %s", token));
+        headers.set("X-GitHub-Api-Version", "2022-11-28");
+        return headers;
+    }
+    private static UriComponentsBuilder buildRetrieveContentFileUri(String repoName, String fileName) {
+        return UriComponentsBuilder.fromUriString(String.format("https://api.github.com/repos/%s/%s/contents/%s", ORGANIZATION, repoName, fileName));
+    }
+
+    /**
+     * max repo per page is 100
+     */
+    private static UriComponentsBuilder buildRetrieveRepoUri() {
+        return UriComponentsBuilder.fromUriString(String.format("https://api.github.com/orgs/%s/repos", ORGANIZATION)).queryParam("per_page", 100);
     }
 
     /**
@@ -128,35 +134,6 @@ public class GithubCommand {
     }
 
     private record PomData(String groupId, Set<String> artifactIds) {
-    }
-
-    private static Set<Dependency> extractDependencies(Document doc) {
-        Set<Dependency> dependencies = new HashSet<>();
-        NodeList dependenciesNode = doc.getElementsByTagName("dependency");
-        for (int i = 0; i < dependenciesNode.getLength(); i++) {
-            Node dependencyNode = dependenciesNode.item(i);
-            if (dependencyNode.getNodeType() == Node.ELEMENT_NODE) {
-                Element dependencyElement = (Element) dependencyNode;
-                String groupId = dependencyElement.getElementsByTagName("groupId").item(0).getTextContent();
-                String artifactId = dependencyElement.getElementsByTagName("artifactId").item(0).getTextContent();
-                dependencies.add(new Dependency(groupId, artifactId));
-            }
-        }
-        return dependencies;
-    }
-
-    private record Dependency(String groupId, String artifactId) {
-    }
-
-    private static Set<String> extractModules(Document doc) {
-        Set<String> modules = new HashSet<>();
-        NodeList moduleNodes = doc.getElementsByTagName("module");
-        for (int i = 0; i < moduleNodes.getLength(); i++) {
-            Node moduleNode = moduleNodes.item(i);
-            String moduleName = moduleNode.getTextContent();
-            modules.add(moduleName);
-        }
-        return modules;
     }
 
     private Mono<Map<String, String>> retrieveDependency(PomData pomData, HttpHeaders headers, Set<String> repositoriesNames,
@@ -196,68 +173,6 @@ public class GithubCommand {
                 .map(this::extractXmlFile);
     }
 
-    private Document extractXmlFile(String content) {
-        String contentStr = extractContent(content);
-        byte[] decodedBytes = Base64.getDecoder().decode(contentStr);
-        String pomXmlFileContent = new String(decodedBytes, StandardCharsets.UTF_8);
-        logger.debug("pom.xml: {}", pomXmlFileContent);
-        try {
-            DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
-            ByteArrayInputStream input = new ByteArrayInputStream(pomXmlFileContent.getBytes(StandardCharsets.UTF_8));
-            return builder.parse(input);
-        } catch (SAXException | IOException | ParserConfigurationException e) {
-            logger.error("failed to parse xml: {}", pomXmlFileContent, e);
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static void printToCsv(String fileName, List<String> dependenciesResult) throws IOException {
-        final CSVFormat csvFormat = CSVFormat.Builder.create()
-                .setHeader("No.", "Repository Name")
-                .build();
-        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
-             CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
-            for (int i = 0; i < dependenciesResult.size(); i++) {
-                printer.printRecord(i + 1, dependenciesResult.get(i));
-            }
-        }
-    }
-
-    private static void printToCsv(String fileName, Map<String, Set<String>> moduleToUsedMap) throws IOException {
-        final CSVFormat csvFormat = CSVFormat.Builder.create()
-                .setHeader("No.", "module", "#usage (repositories)", "usage list-repositories")
-                .build();
-        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
-             CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
-            int currentIndex = 1;
-            for (Map.Entry<String, Set<String>> entry : moduleToUsedMap.entrySet()) {
-                String module = entry.getKey();
-                Set<String> repoByModule = entry.getValue();
-                printer.printRecord(currentIndex++, module, repoByModule.size(), repoByModule.toString());
-            }
-        }
-    }
-
-    private static UriComponentsBuilder buildRetrieveContentFileUri(String repoName, String fileName) {
-        return UriComponentsBuilder.fromUriString(String.format("https://api.github.com/repos/%s/%s/contents/%s", ORGANIZATION, repoName, fileName));
-    }
-
-
-    /**
-     * max repo per page is 100
-     */
-    private static UriComponentsBuilder buildRetrieveRepoUri() {
-        return UriComponentsBuilder.fromUriString(String.format("https://api.github.com/orgs/%s/repos", ORGANIZATION)).queryParam("per_page", 100);
-    }
-
-    private static HttpHeaders buildHeader(String token) {
-        HttpHeaders headers = new HttpHeaders();
-        headers.set(HttpHeaders.ACCEPT, "application/vnd.github+json");
-        headers.set(HttpHeaders.AUTHORIZATION, String.format("Bearer %s", token));
-        headers.set("X-GitHub-Api-Version", "2022-11-28");
-        return headers;
-    }
-
     private Flux<List<String>> retrieveAllRepositoriesNames(UriComponentsBuilder uriBuilder, AtomicInteger page,
                                                             HttpHeaders headers, AtomicInteger javaRepoCounter, Language language) {
         return retrieveAllRepo(uriBuilder, page, headers, javaRepoCounter, language)
@@ -289,7 +204,7 @@ public class GithubCommand {
     }
 
 
-    private boolean hasMorePages(List<String> result) {
+    private static boolean hasMorePages(List<String> result) {
         return !result.isEmpty();
     }
 
@@ -323,11 +238,18 @@ public class GithubCommand {
         return repositoriesNames;
     }
 
-    private static void validateAllRepoResponse(String json, JsonNode rootNode) {
-        if (!rootNode.isArray()) {
-            String errorMessage = String.format("not an array result json: %s", json);
-            logger.error(errorMessage);
-            throw new UnsupportedOperationException(errorMessage);
+    private Document extractXmlFile(String content) {
+        String contentStr = extractContent(content);
+        byte[] decodedBytes = Base64.getDecoder().decode(contentStr);
+        String pomXmlFileContent = new String(decodedBytes, StandardCharsets.UTF_8);
+        logger.debug("pom.xml: {}", pomXmlFileContent);
+        try {
+            DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+            ByteArrayInputStream input = new ByteArrayInputStream(pomXmlFileContent.getBytes(StandardCharsets.UTF_8));
+            return builder.parse(input);
+        } catch (SAXException | IOException | ParserConfigurationException e) {
+            logger.error("failed to parse xml: {}", pomXmlFileContent, e);
+            throw new RuntimeException(e);
         }
     }
 
@@ -338,6 +260,43 @@ public class GithubCommand {
             return content.replaceAll("\n", "");
         } catch (JsonProcessingException e) {
             throw new RuntimeException("failed to parse json", e);
+        }
+    }
+
+    private static Set<Dependency> extractDependencies(Document doc) {
+        Set<Dependency> dependencies = new HashSet<>();
+        NodeList dependenciesNode = doc.getElementsByTagName("dependency");
+        for (int i = 0; i < dependenciesNode.getLength(); i++) {
+            Node dependencyNode = dependenciesNode.item(i);
+            if (dependencyNode.getNodeType() == Node.ELEMENT_NODE) {
+                Element dependencyElement = (Element) dependencyNode;
+                String groupId = dependencyElement.getElementsByTagName("groupId").item(0).getTextContent();
+                String artifactId = dependencyElement.getElementsByTagName("artifactId").item(0).getTextContent();
+                dependencies.add(new Dependency(groupId, artifactId));
+            }
+        }
+        return dependencies;
+    }
+
+    private record Dependency(String groupId, String artifactId) {
+    }
+
+    private static Set<String> extractModules(Document doc) {
+        Set<String> modules = new HashSet<>();
+        NodeList moduleNodes = doc.getElementsByTagName("module");
+        for (int i = 0; i < moduleNodes.getLength(); i++) {
+            Node moduleNode = moduleNodes.item(i);
+            String moduleName = moduleNode.getTextContent();
+            modules.add(moduleName);
+        }
+        return modules;
+    }
+
+    private static void validateAllRepoResponse(String json, JsonNode rootNode) {
+        if (!rootNode.isArray()) {
+            String errorMessage = String.format("not an array result json: %s", json);
+            logger.error(errorMessage);
+            throw new UnsupportedOperationException(errorMessage);
         }
     }
 
@@ -363,6 +322,53 @@ public class GithubCommand {
         }
     }
 
+    private static void printToCsv(String fileName, List<String> dependenciesResult) throws IOException {
+        final CSVFormat csvFormat = CSVFormat.Builder.create()
+                .setHeader("No.", "Repository Name")
+                .build();
+        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
+             CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
+            for (int i = 0; i < dependenciesResult.size(); i++) {
+                printer.printRecord(i + 1, dependenciesResult.get(i));
+            }
+        }
+    }
+
+    private static void printToCsv(String fileName, Map<String, Set<String>> moduleToUsedMap) throws IOException {
+        final CSVFormat csvFormat = CSVFormat.Builder.create()
+                .setHeader("No.", "module", "#usage (repositories)", "usage list-repositories")
+                .build();
+        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
+             CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
+            int currentIndex = 1;
+            for (Map.Entry<String, Set<String>> entry : moduleToUsedMap.entrySet()) {
+                String module = entry.getKey();
+                Set<String> repoByModule = entry.getValue();
+                printer.printRecord(currentIndex++, module, repoByModule.size(), repoByModule.toString());
+            }
+        }
+    }
+
+    private static LinkedHashMap<String, Set<String>> sort(Mono<Map<String, Set<String>>> moduleToReposAggregatedMap) {
+        return moduleToReposAggregatedMap.block().entrySet().stream()
+                .sorted(Map.Entry.<String, Set<String>>comparingByValue(Comparator.comparingInt(Set::size)).reversed())
+                .collect(LinkedHashMap::new, (acc, entry) -> acc.put(entry.getKey(), entry.getValue()), Map::putAll);
+    }
+
+    private static Mono<Map<String, Set<String>>> aggregateByModule(Flux<Map<String, String>> allContainsDependency) {
+        return allContainsDependency
+                .flatMap(map -> Flux.fromIterable(map.entrySet()))
+                .groupBy(Map.Entry::getKey)
+                .flatMap(groupedFlux -> groupedFlux
+                        .map(Map.Entry::getValue)
+                        .collect(Collectors.toSet())
+                        .map(set -> Map.of(groupedFlux.key(), set))
+                )
+                .reduce(new HashMap<>(), (acc, map) -> {
+                    acc.putAll(map);
+                    return acc;
+                });
+    }
 
     private enum Language {
         JAVA("Java");
