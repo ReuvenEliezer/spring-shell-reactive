@@ -10,23 +10,34 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.shell.standard.ShellComponent;
 import org.springframework.shell.standard.ShellMethod;
 import org.springframework.shell.standard.ShellOption;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.springframework.web.util.UriComponentsBuilder;
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
-import java.io.FileWriter;
-import java.io.IOException;
+import javax.xml.parsers.*;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import org.w3c.dom.Element;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
 
 @ShellComponent
 public class GithubCommand {
@@ -54,20 +65,40 @@ public class GithubCommand {
      * https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#list-organization-repositories
      *
      * @param token      https://docs.github.com/en/enterprise-cloud@latest/authentication/authenticating-with-saml-single-sign-on/authorizing-a-personal-access-token-for-use-with-saml-single-sign-on
-     * @param dependency
+     * @param artifactId
      */
-    @ShellMethod(key = "retrieve-all-repository-names-contents-given-dependency", value = "Retrieve all repository names contents given dependency")
-    public void retrieveRepoBasedOnGivenDependency(@ShellOption(value = "-t") String token, @ShellOption(defaultValue = "spring", value = "-s") String dependency) throws IOException {
+    @ShellMethod(key = "aggregate-depended-repo", value = "Retrieve all repository names depend on a given dependency")
+    public void aggregateDependedRepo(@ShellOption(value = "-t") String token,
+                                      @ShellOption(value = "-r", help = "example: \"saas-platform-lib-java17\" (take it from url repo)") String repositoryName) throws IOException {
         Set<String> repositoriesNames = ConcurrentHashMap.newKeySet();
-        AtomicInteger pageNum = new AtomicInteger(1);
+        AtomicInteger pageNum = new AtomicInteger(1); //TODO change to 1
         UriComponentsBuilder repoUriBuilder = buildRetrieveRepoUri();
-        HttpHeaders headers = buildHeader(token);
         AtomicInteger javaRepoCounter = new AtomicInteger(0);
+        HttpHeaders headers = buildHeader(token);
         Flux<List<String>> allJavaRepo = retrieveAllRepositoriesNames(repoUriBuilder, pageNum, headers, javaRepoCounter, Language.JAVA);
-        Flux<String> allContainsDependency = retrieveAllContainsDependency(dependency, allJavaRepo, headers, repositoriesNames);
-        allContainsDependency.blockLast();
+        PomData pomData = retrieveXmlFile(repositoryName, headers).block();
+
+        Flux<Map<String, String>> allContainsDependency = retrieveAllContainsDependency(pomData, allJavaRepo, headers, repositoriesNames);
+
+        //aggregate by module
+        Mono<Map<String, Set<String>>> moduleToReposAggregatedMap = allContainsDependency
+                .flatMap(map -> Flux.fromIterable(map.entrySet()))
+                .groupBy(Map.Entry::getKey)
+                .flatMap(groupedFlux -> groupedFlux
+                        .map(Map.Entry::getValue)
+                        .collect(Collectors.toSet())
+                        .map(set -> Map.of(groupedFlux.key(), set))
+                )
+                .reduce(new HashMap<>(), (acc, map) -> {
+                    acc.putAll(map);
+                    return acc;
+                });
+        Map<String, Set<String>> moduleToReposAggregatedSortedBySizeMap = moduleToReposAggregatedMap.block().entrySet().stream()
+                .sorted(Map.Entry.<String, Set<String>>comparingByValue(Comparator.comparingInt(Set::size)).reversed())
+                .collect(LinkedHashMap::new, (acc, entry) -> acc.put(entry.getKey(), entry.getValue()), Map::putAll);
+
         logger.info("total repositories: {}, repositoriesNames: {} out of {} java repositories", repositoriesNames.size(), repositoriesNames, javaRepoCounter.get());
-        printToCsv(new ArrayList<>(repositoriesNames));
+        printToCsv(repositoryName, moduleToReposAggregatedSortedBySizeMap);
     }
 
     /**
@@ -76,44 +107,133 @@ public class GithubCommand {
      *
      * @return
      */
-    private Flux<String> retrieveAllContainsDependency(String dependency, Flux<List<String>> allJavaRepo, HttpHeaders headers, Set<String> repositoriesNames) {
+    private Flux<Map<String, String>> retrieveAllContainsDependency(PomData pomData, Flux<List<String>> allJavaRepo, HttpHeaders headers, Set<String> repositoriesNames) {
         return allJavaRepo.flatMapIterable(repoNames -> repoNames)
                 .flatMap(repoName -> {
                     UriComponentsBuilder contentFileUriBuilder = buildRetrieveContentFileUri(repoName, "pom.xml");
-                    return webClient.get()
-                            .uri(contentFileUriBuilder.toUriString())
-                            .headers(httpHeaders -> httpHeaders.addAll(headers))
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .retryWhen(Retry.fixedDelay(MAX_RETRY, FIXED_DELAY_ON_RETRY))
-                            .onErrorReturn("")
-                            .filter(e -> !e.isBlank())
-                            .filter(e -> {
-                                String content = extractContent(e);
-                                byte[] decodedBytes = Base64.getDecoder().decode(content);
-                                String pomXmlFileContent = new String(decodedBytes, StandardCharsets.UTF_8);
-//                                logger.info(pomXmlFileContent);
-                                return pomXmlFileContent.contains(dependency);
-                            })
-                            .doOnNext(data -> {
-                                logger.info("repoName: {}", repoName);
-                                repositoriesNames.add(repoName);
-                            })
-                            .onErrorResume(e -> {
-                                printErrorMessage(e);
-                                return Mono.empty();
-                            });
+                    return retrieveDependency(pomData, headers, repositoriesNames, repoName, contentFileUriBuilder);
                 });
     }
 
-    private static void printToCsv(List<String> dependenciesResult) throws IOException {
+    private Mono<PomData> retrieveXmlFile(String repositoryName, HttpHeaders headers) {
+        UriComponentsBuilder uri = buildRetrieveContentFileUri(repositoryName, "pom.xml");
+        return retrieveXmlFile(headers, uri)
+                .map(doc -> {
+                    Set<String> modules = extractModules(doc);
+                    Node groupIdNode = doc.getElementsByTagName("groupId").item(1);
+                    String groupId = groupIdNode.getTextContent();
+                    return new PomData(groupId, modules);
+                });
+
+    }
+
+    private record PomData(String groupId, Set<String> artifactIds) {
+    }
+
+    private static Set<Dependency> extractDependencies(Document doc) {
+        Set<Dependency> dependencies = new HashSet<>();
+        NodeList dependenciesNode = doc.getElementsByTagName("dependency");
+        for (int i = 0; i < dependenciesNode.getLength(); i++) {
+            Node dependencyNode = dependenciesNode.item(i);
+            if (dependencyNode.getNodeType() == Node.ELEMENT_NODE) {
+                Element dependencyElement = (Element) dependencyNode;
+                String groupId = dependencyElement.getElementsByTagName("groupId").item(0).getTextContent();
+                String artifactId = dependencyElement.getElementsByTagName("artifactId").item(0).getTextContent();
+                dependencies.add(new Dependency(groupId, artifactId));
+            }
+        }
+        return dependencies;
+    }
+
+    private record Dependency(String groupId, String artifactId) {
+    }
+
+    private static Set<String> extractModules(Document doc) {
+        Set<String> modules = new HashSet<>();
+        NodeList moduleNodes = doc.getElementsByTagName("module");
+        for (int i = 0; i < moduleNodes.getLength(); i++) {
+            Node moduleNode = moduleNodes.item(i);
+            String moduleName = moduleNode.getTextContent();
+            modules.add(moduleName);
+        }
+        return modules;
+    }
+
+    private Mono<Map<String, String>> retrieveDependency(PomData pomData, HttpHeaders headers, Set<String> repositoriesNames,
+                                                         String repoName, UriComponentsBuilder contentFileUriBuilder) {
+        return retrieveXmlFile(headers, contentFileUriBuilder)
+                .mapNotNull(pomXmlDoc -> {
+                    Set<Dependency> dependencies = extractDependencies(pomXmlDoc);
+                    String groupId = pomData.groupId;
+                    Set<String> artifactIds = pomData.artifactIds;
+                    Map<String, String> moduleToRepo = dependencies.stream()
+                            .filter(dependency -> dependency.groupId.equals(groupId)
+                                    && artifactIds.contains(dependency.artifactId))
+                            .collect(Collectors.toMap(Dependency::artifactId, dep -> repoName));
+                    if (moduleToRepo.isEmpty()) {
+                        return null;
+                    }
+                    return moduleToRepo;
+                })
+                .doOnNext(data -> {
+                    logger.info("repoName: {} depend on modules {}", repoName, data.keySet());
+                    repositoriesNames.add(repoName);
+                });
+    }
+
+    private Mono<Document> retrieveXmlFile(HttpHeaders headers, UriComponentsBuilder contentFileUriBuilder) {
+        return webClient.get()
+                .uri(contentFileUriBuilder.toUriString())
+                .headers(httpHeaders -> httpHeaders.addAll(headers))
+                .retrieve()
+                .bodyToMono(String.class)
+                .retryWhen(Retry.fixedDelay(MAX_RETRY, FIXED_DELAY_ON_RETRY))
+                .onErrorResume(e -> {
+                    printErrorMessage(e);
+                    return Mono.empty();
+                })
+                .filter(e -> !e.isBlank())
+                .map(this::extractXmlFile);
+    }
+
+    private Document extractXmlFile(String content) {
+        String contentStr = extractContent(content);
+        byte[] decodedBytes = Base64.getDecoder().decode(contentStr);
+        String pomXmlFileContent = new String(decodedBytes, StandardCharsets.UTF_8);
+        logger.debug("pom.xml: {}", pomXmlFileContent);
+        try {
+            DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+            ByteArrayInputStream input = new ByteArrayInputStream(pomXmlFileContent.getBytes(StandardCharsets.UTF_8));
+            return builder.parse(input);
+        } catch (SAXException | IOException | ParserConfigurationException e) {
+            logger.error("failed to parse xml: {}", pomXmlFileContent, e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void printToCsv(String fileName, List<String> dependenciesResult) throws IOException {
         final CSVFormat csvFormat = CSVFormat.Builder.create()
                 .setHeader("No.", "Repository Name")
                 .build();
-        try (FileWriter fileWriter = new FileWriter("dependenciesResult.csv");
+        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
              CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
             for (int i = 0; i < dependenciesResult.size(); i++) {
                 printer.printRecord(i + 1, dependenciesResult.get(i));
+            }
+        }
+    }
+
+    private static void printToCsv(String fileName, Map<String, Set<String>> moduleToUsedMap) throws IOException {
+        final CSVFormat csvFormat = CSVFormat.Builder.create()
+                .setHeader("No.", "module", "#usage (repositories)", "usage list-repositories")
+                .build();
+        try (FileWriter fileWriter = new FileWriter(fileName + ".csv");
+             CSVPrinter printer = new CSVPrinter(fileWriter, csvFormat)) {
+            int currentIndex = 1;
+            for (Map.Entry<String, Set<String>> entry : moduleToUsedMap.entrySet()) {
+                String module = entry.getKey();
+                Set<String> repoByModule = entry.getValue();
+                printer.printRecord(currentIndex++, module, repoByModule.size(), repoByModule.toString());
             }
         }
     }
@@ -222,22 +342,24 @@ public class GithubCommand {
     }
 
     private static void printErrorMessage(Throwable e) {
-        if (!(e instanceof WebClientResponseException ex)) {
-            logger.error("Error occurred: {}", e.getMessage(), e);
-            return;
-        }
-        if (ex.getStatusCode().value() == HttpStatus.NOT_FOUND.value()) {
-            logger.info("ignore from repo that not including pom.xml {}", ex.getMessage(), ex);
-        } else if (ex.getStatusCode().value() == HttpStatus.FORBIDDEN.value() || ex.getStatusCode().value() == HttpStatus.TOO_MANY_REQUESTS.value()) {
-            logger.error("Error occurred: API rate limit exceeded for user ID  {}", ex.getMessage(), ex);
-            /**
-             * {
-             *     "message": "API rate limit exceeded for user ID 144931323. If you reach out to GitHub Support for help, please include the request ID EF65:CBAE:132BD4B7:136A4626:6565C271.",
-             *     "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"
-             * }
-             */
+        if (e.getCause() instanceof WebClientResponseException webClientResponseException) {
+            HttpStatusCode statusCode = webClientResponseException.getStatusCode();
+            if (statusCode.value() == HttpStatus.NOT_FOUND.value()) {
+                logger.info("ignore from repo that not including pom.xml {}", e.getMessage());
+            } else if (statusCode.value() == HttpStatus.FORBIDDEN.value()
+                    || statusCode.value() == HttpStatus.TOO_MANY_REQUESTS.value()) {
+                logger.error("Error occurred: API rate limit exceeded for user ID  {}", e.getMessage(), e);
+                /**
+                 * {
+                 *     "message": "API rate limit exceeded for user ID 144931323. If you reach out to GitHub Support for help, please include the request ID EF65:CBAE:132BD4B7:136A4626:6565C271.",
+                 *     "documentation_url": "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"
+                 * }
+                 */
+            } else {
+                logger.error("Error occurred: {}", e.getMessage(), e);
+            }
         } else {
-            logger.error("Error occurred: {}", ex.getMessage(), ex);
+            logger.error("Error occurred: {}", e.getMessage(), e);
         }
     }
 
